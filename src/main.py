@@ -134,6 +134,14 @@ async def _scrape_keyword(
     await asyncio.sleep(4)
 
 
+    # Wait for the DOM body to be present before we start scrolling.
+    # (with wait_until='commit' the body may not exist yet)
+    try:
+        await page.wait_for_selector("body", timeout=20_000)
+        Actor.log.info(f"[{keyword}] DOM body ready.")
+    except Exception:  # noqa: BLE001
+        Actor.log.warning(f"[{keyword}] Timed out waiting for body — will attempt scroll anyway.")
+
     too_old_streak = 0
     no_new_content_streak = 0
 
@@ -184,8 +192,11 @@ async def _scrape_keyword(
         else:
             no_new_content_streak = 0
 
-        # Scroll down to trigger more results
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        # Scroll down to trigger more results.
+        # Guard against document.body still being null on very slow loads.
+        await page.evaluate(
+            "document.body && window.scrollTo(0, document.body.scrollHeight)"
+        )
         await asyncio.sleep(scroll_pause)
 
     await page.close()
