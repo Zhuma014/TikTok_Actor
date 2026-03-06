@@ -229,14 +229,14 @@ async def main() -> None:
                 Actor.log.warning(f"Could not set up proxy: {exc}")
 
         # ---- HTTP client -------------------------------------------
-        proxies = {"https://": proxy_url, "http://": proxy_url} if proxy_url else None
+        # httpx 0.20+ removed the `proxies` dict; use `proxy=` (singular) instead.
         cookies = {
             "tiktok_webapp_theme": "light",
             "tt_chain_token": "",
         }
 
         async with httpx.AsyncClient(
-            proxies=proxies,
+            proxy=proxy_url,
             cookies=cookies,
             follow_redirects=True,
         ) as client:
