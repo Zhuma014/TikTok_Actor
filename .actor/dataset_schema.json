@@ -1,0 +1,84 @@
+{
+    "$schema": "https://apify.com/schemas/v1/dataset.ide.json",
+    "actorSpecification": 1,
+    "fields": {},
+    "views": {
+        "overview": {
+            "title": "Overview",
+            "transformation": {
+                "fields": [
+                    "id",
+                    "url",
+                    "description",
+                    "author_username",
+                    "author_display_name",
+                    "plays",
+                    "likes",
+                    "comments",
+                    "shares",
+                    "keyword",
+                    "cover_url",
+                    "created_at",
+                    "scraped_at"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "id": {
+                        "label": "Video ID",
+                        "format": "text"
+                    },
+                    "url": {
+                        "label": "Video URL",
+                        "format": "link"
+                    },
+                    "description": {
+                        "label": "Description",
+                        "format": "text"
+                    },
+                    "author_username": {
+                        "label": "Author Username",
+                        "format": "text"
+                    },
+                    "author_display_name": {
+                        "label": "Author Display Name",
+                        "format": "text"
+                    },
+                    "plays": {
+                        "label": "Views / Plays",
+                        "format": "number"
+                    },
+                    "likes": {
+                        "label": "Likes",
+                        "format": "number"
+                    },
+                    "comments": {
+                        "label": "Comments",
+                        "format": "number"
+                    },
+                    "shares": {
+                        "label": "Shares",
+                        "format": "number"
+                    },
+                    "keyword": {
+                        "label": "Search Keyword",
+                        "format": "text"
+                    },
+                    "cover_url": {
+                        "label": "Cover Image",
+                        "format": "image"
+                    },
+                    "created_at": {
+                        "label": "Video Created At",
+                        "format": "text"
+                    },
+                    "scraped_at": {
+                        "label": "Scraped At",
+                        "format": "text"
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,49 @@
+{
+    "$schema": "https://apify.com/schemas/v1/input.ide.json",
+    "title": "TikTok Keyword Video Scraper",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "keywords": {
+            "title": "Keywords",
+            "type": "array",
+            "description": "List of keywords to search on TikTok. Each keyword will be scraped separately.",
+            "editor": "stringList",
+            "prefill": [
+                "python programming",
+                "travel vlog"
+            ]
+        },
+        "max_results_per_keyword": {
+            "title": "Max Results Per Keyword",
+            "type": "integer",
+            "description": "Maximum number of videos to collect for each keyword.",
+            "default": 30,
+            "minimum": 1,
+            "maximum": 500
+        },
+        "request_delay_seconds": {
+            "title": "Delay Between Requests (seconds)",
+            "type": "number",
+            "description": "Time in seconds to wait between paginated API requests to avoid rate limiting.",
+            "default": 1.5,
+            "minimum": 0.5,
+            "maximum": 30
+        },
+        "proxy_configuration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Apify proxy configuration. Using residential proxies is strongly recommended for TikTok.",
+            "editor": "proxy",
+            "prefill": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": [
+                    "RESIDENTIAL"
+                ]
+            }
+        }
+    },
+    "required": [
+        "keywords"
+    ]
+}
