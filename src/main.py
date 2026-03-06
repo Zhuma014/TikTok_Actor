@@ -121,14 +121,18 @@ async def _scrape_keyword(
     Actor.log.info(f"[{keyword}] Opening: {search_url}")
 
     try:
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=45_000)
+        # 'commit' fires as soon as the response headers arrive (first byte),
+        # which is the fastest signal and avoids waiting for heavy JS to finish.
+        await page.goto(search_url, wait_until="commit", timeout=60_000)
+        Actor.log.info(f"[{keyword}] Page navigation committed, waiting for API data...")
     except Exception as exc:  # noqa: BLE001
-        Actor.log.error(f"[{keyword}] Page navigation failed: {exc}")
-        await page.close()
-        return results
+        # Even on a timeout the browser may have partially loaded and fired
+        # API requests, so continue rather than giving up immediately.
+        Actor.log.warning(f"[{keyword}] Navigation warning (continuing): {exc}")
 
-    # Wait for initial API responses to arrive
-    await asyncio.sleep(scroll_pause + 1)
+    # Give TikTok's JS time to initialise and fire its first API requests.
+    await asyncio.sleep(4)
+
 
     too_old_streak = 0
     no_new_content_streak = 0
