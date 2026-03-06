@@ -1,7 +1,8 @@
 """TikTok Keyword Video Scraper - Apify Actor.
 
-Uses the TikTokApi library (Playwright-backed) to search TikTok by keywords
-and store video metadata into the Apify dataset.
+Uses Playwright to open TikTok's search page in a real Chromium browser.
+TikTok's own JavaScript generates properly signed API requests; we intercept
+the JSON responses directly, so no third-party TikTok library is needed.
 
 Supports time-range filtering: last_day, last_week, last_month,
 last_3_months, last_year, or all (no filter).
@@ -10,14 +11,16 @@ last_3_months, last_year, or all (no filter).
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote_plus
 
 from apify import Actor
-from TikTokApi import TikTokApi
+from playwright.async_api import BrowserContext, Page, async_playwright
 
 # ---------------------------------------------------------------------------
-# Time-filter helper
+# Time-filter helpers
 # ---------------------------------------------------------------------------
 TIME_FILTER_DELTAS: dict[str, timedelta | None] = {
     "all": None,
@@ -30,64 +33,38 @@ TIME_FILTER_DELTAS: dict[str, timedelta | None] = {
 
 
 def _get_cutoff(time_filter: str) -> datetime | None:
-    """Return the UTC cutoff datetime for the given filter name, or None for 'all'."""
     delta = TIME_FILTER_DELTAS.get(time_filter)
-    if delta is None:
-        return None
-    return datetime.now(tz=timezone.utc) - delta
+    return (datetime.now(tz=timezone.utc) - delta) if delta else None
 
 
-def _within_period(video_dict: dict[str, Any], cutoff: datetime | None) -> bool:
-    """Return True if the video's createTime is at or after the cutoff."""
-    if cutoff is None:
-        return True
-    create_time: int = video_dict.get("createTime", 0)
-    if not create_time:
-        return True  # unknown timestamp → keep
-    video_dt = datetime.fromtimestamp(int(create_time), tz=timezone.utc)
-    return video_dt >= cutoff
-
-
-def _is_older_than_cutoff(video_dict: dict[str, Any], cutoff: datetime | None) -> bool:
-    """Return True if the video is OLDER than the cutoff (used as early-stop signal)."""
-    if cutoff is None:
-        return False
-    create_time: int = video_dict.get("createTime", 0)
-    if not create_time:
-        return False
-    video_dt = datetime.fromtimestamp(int(create_time), tz=timezone.utc)
-    return video_dt < cutoff
-
-
-# ---------------------------------------------------------------------------
-# Video data extraction
-# ---------------------------------------------------------------------------
-
-def _parse_video(video: Any, keyword: str) -> dict[str, Any] | None:
-    """Convert a TikTokApi Video object into a flat dictionary for storage."""
+def _parse_video(raw: dict[str, Any], keyword: str) -> dict[str, Any] | None:
+    """Flatten a raw TikTok video dict into a storage-ready record."""
     try:
-        d = video.as_dict
-        author = d.get("author", {})
-        stats = d.get("stats", {})
-        create_time = d.get("createTime", 0)
-        video_id = str(d.get("id", ""))
-        author_username = author.get("uniqueId", author.get("unique_id", ""))
+        # TikTok wraps the video under an 'item' key in some endpoints
+        v = raw.get("item", raw)
+        video_id = str(v.get("id", ""))
+        if not video_id:
+            return None
+
+        author = v.get("author", {})
+        stats = v.get("stats", {})
+        create_time = int(v.get("createTime", 0))
+        username = author.get("uniqueId", author.get("unique_id", ""))
 
         return {
             "id": video_id,
-            "url": f"https://www.tiktok.com/@{author_username}/video/{video_id}",
-            "description": d.get("desc", ""),
-            "author_username": author_username,
+            "url": f"https://www.tiktok.com/@{username}/video/{video_id}",
+            "description": v.get("desc", ""),
+            "author_username": username,
             "author_display_name": author.get("nickname", ""),
             "likes": int(stats.get("diggCount", stats.get("heart", 0))),
             "comments": int(stats.get("commentCount", 0)),
             "shares": int(stats.get("shareCount", 0)),
             "plays": int(stats.get("playCount", 0)),
-            "cover_url": d.get("video", {}).get("cover", "") or "",
+            "cover_url": v.get("video", {}).get("cover", "") or "",
             "created_at": (
-                datetime.fromtimestamp(int(create_time), tz=timezone.utc).isoformat()
-                if create_time
-                else None
+                datetime.fromtimestamp(create_time, tz=timezone.utc).isoformat()
+                if create_time else None
             ),
             "keyword": keyword,
             "scraped_at": datetime.now(tz=timezone.utc).isoformat(),
@@ -95,6 +72,121 @@ def _parse_video(video: Any, keyword: str) -> dict[str, Any] | None:
     except Exception as exc:  # noqa: BLE001
         Actor.log.warning(f"Failed to parse video: {exc}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Per-keyword scrape using Playwright network interception
+# ---------------------------------------------------------------------------
+
+async def _scrape_keyword(
+    context: BrowserContext,
+    keyword: str,
+    max_results: int,
+    cutoff: datetime | None,
+    scroll_pause: float = 2.0,
+) -> list[dict[str, Any]]:
+    """Open TikTok search in a browser tab and collect videos via intercepted API calls."""
+    results: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    # Queue that receives parsed response payloads from the response handler
+    payload_queue: asyncio.Queue[list[dict]] = asyncio.Queue()
+
+    page: Page = await context.new_page()
+
+    async def on_response(response) -> None:  # noqa: ANN001
+        url: str = response.url
+        # Capture TikTok's search/explore API calls
+        if (
+            "tiktok.com/api/search" in url
+            or "tiktok.com/api/explore" in url
+            or "tiktok.com/api/recommend" in url
+        ):
+            try:
+                body = await response.body()
+                data = json.loads(body)
+                items: list[dict] = (
+                    data.get("data")
+                    or data.get("item_list")
+                    or data.get("itemList")
+                    or []
+                )
+                if items:
+                    await payload_queue.put(items)
+            except Exception:  # noqa: BLE001
+                pass
+
+    page.on("response", on_response)
+
+    search_url = f"https://www.tiktok.com/search/video?q={quote_plus(keyword)}"
+    Actor.log.info(f"[{keyword}] Opening: {search_url}")
+
+    try:
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=45_000)
+    except Exception as exc:  # noqa: BLE001
+        Actor.log.error(f"[{keyword}] Page navigation failed: {exc}")
+        await page.close()
+        return results
+
+    # Wait for initial API responses to arrive
+    await asyncio.sleep(scroll_pause + 1)
+
+    too_old_streak = 0
+    no_new_content_streak = 0
+
+    while len(results) < max_results:
+        # Drain the queue of any intercepted payloads
+        new_items_this_round = 0
+        while not payload_queue.empty():
+            raw_items = await payload_queue.get()
+            for raw in raw_items:
+                parsed = _parse_video(raw, keyword)
+                if not parsed or parsed["id"] in seen_ids:
+                    continue
+                seen_ids.add(parsed["id"])
+
+                # Time filter check
+                create_ts = raw.get("item", raw).get("createTime", 0)
+                if cutoff and create_ts:
+                    video_dt = datetime.fromtimestamp(int(create_ts), tz=timezone.utc)
+                    if video_dt < cutoff:
+                        too_old_streak += 1
+                        if too_old_streak >= 10:
+                            Actor.log.info(
+                                f"[{keyword}] 10 consecutive videos older than cutoff. Stopping early."
+                            )
+                            break
+                        continue
+                    too_old_streak = 0
+
+                results.append(parsed)
+                new_items_this_round += 1
+                Actor.log.info(
+                    f"[{keyword}] {len(results)}/{max_results}: {parsed['url']}"
+                )
+                if len(results) >= max_results:
+                    break
+
+            if too_old_streak >= 10:
+                break
+
+        if len(results) >= max_results or too_old_streak >= 10:
+            break
+
+        if new_items_this_round == 0:
+            no_new_content_streak += 1
+            if no_new_content_streak >= 4:
+                Actor.log.info(f"[{keyword}] No new content after scrolling. Done.")
+                break
+        else:
+            no_new_content_streak = 0
+
+        # Scroll down to trigger more results
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(scroll_pause)
+
+    await page.close()
+    Actor.log.info(f"[{keyword}] Collected {len(results)} videos.")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +198,11 @@ async def main() -> None:
     async with Actor:
         actor_input = await Actor.get_input() or {}
 
-        # ── Input parameters ──────────────────────────────────────────────
         keywords: list[str] = actor_input.get("keywords", [])
         max_results: int = int(actor_input.get("max_results_per_keyword", 30))
         time_filter: str = actor_input.get("time_filter", "all").strip().lower()
         ms_token: str = actor_input.get("ms_token", "").strip()
+        proxy_config_input: dict = actor_input.get("proxy_configuration", {})
 
         if not keywords:
             Actor.log.error("No keywords provided in Actor input. Exiting.")
@@ -118,9 +210,7 @@ async def main() -> None:
             return
 
         if time_filter not in TIME_FILTER_DELTAS:
-            Actor.log.warning(
-                f"Unknown time_filter '{time_filter}', defaulting to 'all'."
-            )
+            Actor.log.warning(f"Unknown time_filter '{time_filter}', defaulting to 'all'.")
             time_filter = "all"
 
         cutoff = _get_cutoff(time_filter)
@@ -130,72 +220,87 @@ async def main() -> None:
             + (f" | cutoff={cutoff.isoformat()}" if cutoff else "")
         )
 
-        # ── TikTokApi session ────────────────────────────────────────────
-        # ms_token is optional but improves reliability when provided.
-        async with TikTokApi() as api:
-            await api.create_sessions(
-                ms_tokens=[ms_token] if ms_token else None,
-                num_sessions=1,
-                sleep_after=3,
-                headless=True,
+        # ── Proxy ─────────────────────────────────────────────────────────
+        proxy_url: str | None = None
+        if proxy_config_input:
+            try:
+                proxy_configuration = await Actor.create_proxy_configuration(
+                    actor_proxy_input=proxy_config_input
+                )
+                if proxy_configuration:
+                    proxy_url = await proxy_configuration.new_url()
+                    Actor.log.info(f"Proxy configured: {proxy_url[:40]}...")
+            except Exception as exc:  # noqa: BLE001
+                Actor.log.warning(f"Could not set up proxy: {exc}")
+
+        # ── Playwright ────────────────────────────────────────────────────
+        async with async_playwright() as pw:
+            launch_args = [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-setuid-sandbox",
+                "--disable-gpu",
+            ]
+            proxy_settings = (
+                {"server": proxy_url} if proxy_url else None
             )
+
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=launch_args,
+                proxy=proxy_settings,
+            )
+
+            # Build cookies list
+            cookies_list = [
+                {"name": "tiktok_webapp_theme", "value": "light",
+                 "domain": ".tiktok.com", "path": "/"},
+            ]
+            if ms_token:
+                cookies_list.append(
+                    {"name": "msToken", "value": ms_token,
+                     "domain": ".tiktok.com", "path": "/"}
+                )
+
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+                timezone_id="America/New_York",
+                proxy=proxy_settings,
+            )
+            await context.add_cookies(cookies_list)
 
             for keyword in keywords:
                 Actor.log.info(f"=== Scraping keyword: '{keyword}' ===")
-                collected: list[dict[str, Any]] = []
-                too_old_streak = 0  # consecutive videos older than cutoff → early-stop
-
                 try:
-                    async for video in api.search.videos(keyword, count=max_results):
-                        raw = video.as_dict
-
-                        # Early stop: if several consecutive videos are older than
-                        # the cutoff, TikTok has passed the relevant window.
-                        if _is_older_than_cutoff(raw, cutoff):
-                            too_old_streak += 1
-                            if too_old_streak >= 5:
-                                Actor.log.info(
-                                    f"[{keyword}] 5 consecutive videos older than "
-                                    f"cutoff ({time_filter}). Stopping early."
-                                )
-                                break
-                            continue
-                        else:
-                            too_old_streak = 0
-
-                        if not _within_period(raw, cutoff):
-                            continue
-
-                        parsed = _parse_video(video, keyword)
-                        if parsed:
-                            collected.append(parsed)
-                            Actor.log.info(
-                                f"[{keyword}] Collected {len(collected)}/{max_results}: "
-                                f"{parsed['url']}"
-                            )
-
-                        if len(collected) >= max_results:
-                            break
-
+                    videos = await _scrape_keyword(
+                        context=context,
+                        keyword=keyword,
+                        max_results=max_results,
+                        cutoff=cutoff,
+                    )
                 except Exception as exc:  # noqa: BLE001
-                    Actor.log.error(
-                        f"[{keyword}] Error during scraping: {exc}. "
-                        "If this persists, try providing an ms_token in the input."
-                    )
+                    Actor.log.error(f"[{keyword}] Unexpected error: {exc}")
+                    videos = []
 
-                if collected:
-                    await Actor.push_data(collected)
-                    Actor.log.info(
-                        f"[{keyword}] Pushed {len(collected)} videos to dataset."
-                    )
+                if videos:
+                    await Actor.push_data(videos)
+                    Actor.log.info(f"[{keyword}] Pushed {len(videos)} videos to dataset.")
                 else:
                     Actor.log.warning(
                         f"[{keyword}] No videos collected. "
-                        "Try providing a valid ms_token or check your proxy settings."
+                        "Try a different ms_token or check proxy settings."
                     )
 
-                # Brief pause between keywords
                 if keyword != keywords[-1]:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(3)
+
+            await context.close()
+            await browser.close()
 
         Actor.log.info("All keywords processed. Actor finished.")

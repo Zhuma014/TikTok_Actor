@@ -2,5 +2,4 @@
 # https://pip.pypa.io/en/latest/reference/requirements-file-format/
 
 apify<4.0.0
-TikTokApi>=6.3.0
 playwright>=1.40.0
