@@ -1,35 +1,45 @@
 # First, specify the base Docker image.
-# You can see the Docker images from Apify at https://hub.docker.com/r/apify/.
-# You can also use any other image from Docker Hub.
+# You can see the Docker images from Apify at https://hub.docker.com/r/apify/
+# Using playwright image which includes browser dependencies
 FROM apify/actor-python:3.14
 
+# Switch to root temporarily to install system-level browser dependencies
+USER root
+RUN apt-get update && apt-get install -y \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxkbcommon0 \
+    libgbm1 \
+    libasound2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    && rm -rf /var/lib/apt/lists/*
 USER myuser
 
-# Second, copy just requirements.txt into the Actor image,
-# since it should be the only file that affects the dependency install in the next step,
-# in order to speed up the build
+# Copy and install Python dependencies
 COPY --chown=myuser:myuser requirements.txt ./
 
-# Install the packages specified in requirements.txt,
-# Print the installed Python version, pip version
-# and all installed packages with their versions for debugging
 RUN echo "Python version:" \
  && python --version \
  && echo "Pip version:" \
  && pip --version \
  && echo "Installing dependencies:" \
  && pip install -r requirements.txt \
+ && echo "Installing Playwright browsers:" \
+ && python -m playwright install chromium \
  && echo "All installed Python packages:" \
  && pip freeze
 
-# Next, copy the remaining files and directories with the source code.
-# Since we do this after installing the dependencies, quick build will be really fast
-# for most source file changes.
+# Copy the remaining source files
 COPY --chown=myuser:myuser . ./
 
-# Use compileall to ensure the runnability of the Actor Python code.
+# Compile Python source for early syntax error detection
 RUN python3 -m compileall -q src/
 
-# Specify how to launch the source code of your Actor.
-# By default, the "python3 -m src" command is run
+# Launch the Actor
 CMD ["python3", "-m", "src"]
